@@ -22,6 +22,8 @@ Endpoints:
     POST /v1/release-batches
     GET  /v1/release-batches/{batch_id}
     POST /v1/release-batches/{batch_id}/fulfillment-snapshot
+    POST /v1/release-batches/{batch_id}/admission-attestation
+    GET  /v1/admission-attestations/{attestation_id}
 """
 
 import json
@@ -31,6 +33,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+from .attestation import validate_attestation_body
 from .batches import validate_batch_body
 from .common import ClientError, ConflictError, NotFound, stable_hash
 from .compare import compare_assessments
@@ -57,7 +60,10 @@ _ASSESS_RE = re.compile(
 )
 _BATCH_RE = re.compile(
     r"^/v1/release-batches(?:/([A-Za-z0-9._-]{1,128})"
-    r"(/(?:fulfillment-snapshot))?)?$"
+    r"(/(?:fulfillment-snapshot|admission-attestation))?)?$"
+)
+_ATTEST_RE = re.compile(
+    r"^/v1/admission-attestations(?:/([A-Za-z0-9._-]{1,128}))?$"
 )
 
 
@@ -347,6 +353,27 @@ class Api:
             raise ClientError("request body must be a JSON object")
         return build_batch_snapshot(body, manifest, batch_id)
 
+    # -- immutable admission attestations ---------------------------------
+
+    def register_admission_attestation(self, path_batch_id, body):
+        (
+            attestation_id,
+            batch_id,
+            expected_hash,
+            snapshot_body,
+        ) = validate_attestation_body(body, path_batch_id)
+        return self.store.register_admission_attestation(
+            attestation_id, batch_id, expected_hash, snapshot_body
+        )
+
+    def get_admission_attestation(self, attestation_id):
+        out = self.store.get_admission_attestation(attestation_id)
+        if out is None:
+            raise NotFound(
+                "admission attestation %r not found" % attestation_id
+            )
+        return out
+
 
 def make_server(host, port, store):
     api = Api(store)
@@ -426,6 +453,8 @@ def make_server(host, port, store):
                                 "POST /v1/release-batches",
                                 "GET  /v1/release-batches/{batch_id}",
                                 "POST /v1/release-batches/{batch_id}/fulfillment-snapshot",
+                                "POST /v1/release-batches/{batch_id}/admission-attestation",
+                                "GET  /v1/admission-attestations/{attestation_id}",
                             ],
                         },
                     )
@@ -445,6 +474,20 @@ def make_server(host, port, store):
                     return self._json(
                         200,
                         api.release_batch_snapshot(m.group(1), self._body()),
+                    )
+                if m and method == "POST" and m.group(1) is not None \
+                        and m.group(2) == "/admission-attestation":
+                    return self._json(
+                        200,
+                        api.register_admission_attestation(
+                            m.group(1), self._body()
+                        ),
+                    )
+
+                m = _ATTEST_RE.match(path)
+                if m and method == "GET" and m.group(1) is not None:
+                    return self._json(
+                        200, api.get_admission_attestation(m.group(1))
                     )
 
                 m = _REVISION_RE.match(path)

@@ -28,7 +28,7 @@ python3 main.py
 数据持久化在 SQLite（容器内 `/data/app.db`，本地默认 `./data/app.db`，
 环境变量 `APP_DB` 可改）。
 
-自检（启动临时实例跑 520 项端到端检查）：
+自检（启动临时实例跑 620+ 项端到端检查）：
 
 ```bash
 python3 tests/selftest.py
@@ -58,6 +58,8 @@ python3 tests/selftest.py
 | POST | `/v1/release-batches` | 登记不可变许可证发布批次（内容一致时幂等） |
 | GET | `/v1/release-batches/{batch_id}` | 读取已登记批次清单 |
 | POST | `/v1/release-batches/{batch_id}/fulfillment-snapshot` | 批次履约状态快照（截止日 + 证据判定） |
+| POST | `/v1/release-batches/{batch_id}/admission-attestation` | 登记不可变准入证明（全部义务 `satisfied` 才放行，幂等） |
+| GET | `/v1/admission-attestations/{attestation_id}` | 读取已登记准入证明 |
 
 ### 不可变修订与原子发布（含并发发布与回滚）
 
@@ -566,12 +568,148 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
 # 404
 ```
 
+### 不可变准入证明 `POST /v1/release-batches/{batch_id}/admission-attestation`
+
+为**已冻结登记**的发布批次登记一份不可变的准入证明。调用方提交唯一
+`attestation_id`、`batch_id`、期望的 `batch_hash`，以及生成履约快照所需的
+**全部**输入：当前时刻 `now`、发布时刻 `release_at`、IANA `timezone`、
+工作日/节假日、每项义务的 `{offset, unit, depends_on}` 截止规则、每份带
+`provided_at` 的履约材料与嵌套 `all`/`any` 证据规则。请求体中的
+`batch_id` 必须与路径一致（否则 422）；排期与证据语义与
+[批次履约状态快照](#批次履约状态快照-post-v1release-batchesbatch_idfulfillment-snapshot)
+**完全一致**（同一套规范化、期限窗口与判定逻辑）。
+
+服务端在**同一个 SQLite 即时写事务**（`BEGIN IMMEDIATE`，整笔操作持有写锁）
+中依次完成，任何一步失败都整体回滚，**绝不留下证明记录**：
+
+1. 读取冻结批次清单；批次不存在 → **404**；
+2. 核对请求 `batch_hash` 与冻结清单的 `batch_hash`；不符 → **409**
+   `reason: "batch-hash-mismatch"`（附期望值与已登记值）；
+3. 在该事务内基于冻结清单**重算履约快照**：任一快照输入非法（未知时区、
+   非法时刻/日期、缺义务截止规则、悬空依赖/依赖成环、非法材料或证据规则
+   等）→ 整体 **422**，不产生部分结果；
+4. 仅当快照中**每个**去重后的 `(组件, 义务)` 实例均为 `satisfied`
+   （`summary.pending == 0` 且 `summary.overdue == 0`）时才写入证明；
+   存在任何 `pending`/`overdue` → **409**
+   `reason: "obligations-not-satisfied"`，响应附 `snapshot_hash`、`summary`
+   与全部未满足实例（`component`/`obligation`/`deadline`/`status`/`gaps`），
+   同样不留记录。
+
+成功时返回证明哈希、采用的规则修订与嵌入的重算快照：
+
+```json
+{
+  "attestation_id": "att-2026-10-01-001",
+  "batch_id": "release-2026-10-01",
+  "batch_hash": "b75b3f19…（64 位）",
+  "snapshot_hash": "c023f1aa…（64 位）",
+  "rule_revisions": [
+    {"assessment_id": "384f1a0e…", "ruleset": "default",
+     "revision": "9f12d4f1324eaea3", "rules_hash": "9f12d4f1…（64 位）"}
+  ],
+  "snapshot": { ……与 fulfillment-snapshot 完全相同的快照对象（含实例与 summary）…… },
+  "attestation_hash": "2f8b0a71…（64 位 SHA-256）",
+  "created": true
+}
+```
+
+- `attestation_hash` 是规范化证明内容（`attestation_id`、`batch_id`、
+  `batch_hash`、`snapshot_hash`、`rule_revisions` 与完整 `snapshot`，不含
+  哈希字段本身）的 SHA-256。
+- `rule_revisions` 即冻结批次清单中各核算锁定的规则集与不可变修订——证明
+  背书的正是快照所采用的那一版规则。
+
+**幂等与冲突**：同一 `attestation_id` 仅在**规范化内容一致**时幂等。
+规范化内容 = 快照输入的规范化投影（时刻统一换算为 UTC、材料/工作日/节假日/
+依赖等全部排序去重、证据规则归一），因此：材料与字段顺序、对象键序、
+`workdays`/`holidays`/`depends_on` 的排列、以及同一时刻的不同写法（
+`2026-09-25T08:00:00Z` 与 `2026-09-25T16:00:00+08:00`）都不改变内容；
+重放返回 `"created": false` 及逐字节相同的证明/哈希。同一 `attestation_id`
+携带不同规范化内容（如改了 `now`、材料或规则）→ **409**
+`reason: "attestation-id-reused"`（附已登记与本次的 `request_hash` 及
+已登记 `batch_id`），已登记证明不会被改写。
+
+**不可变性**：证明只从冻结批次清单与其锁定的不可变规则修订派生，写入后
+**后续的规则发布（新草稿/激活修订）或材料变化都不会改变已登记证明**——
+证明内嵌的 `snapshot` 与 `rule_revisions` 原样保留；GET
+（`GET /v1/admission-attestations/{attestation_id}`，未知 id 返回 404）
+随时可读，响应不含 `created` 字段。
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 批次 release-2026-10-01 已登记（见“不可变许可证发布批次”），读取其 hash
+BH=$(curl -sS "$BASE/v1/release-batches/release-2026-10-01" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["batch_hash"])')
+
+# 2) 在全部材料均不晚于各自截止日、每个实例均 satisfied 时登记证明
+curl -sS -X POST \
+  "$BASE/v1/release-batches/release-2026-10-01/admission-attestation" \
+  -H 'Content-Type: application/json' -d @- <<JSON
+{
+  "attestation_id": "att-2026-10-01-001",
+  "batch_id": "release-2026-10-01",
+  "batch_hash": "$BH",
+  "now": "2026-10-01T12:00:00+08:00",
+  "release_at": "2026-09-25T16:00:00+08:00",
+  "timezone": "Asia/Shanghai",
+  "workdays": [1, 2, 3, 4, 5],
+  "holidays": ["2026-10-01", "2026-10-02"],
+  "obligations": {
+    "attribution":  {"offset": 30, "unit": "calendar_day", "depends_on": []},
+    "license-text": {"offset": 20, "unit": "calendar_day", "depends_on": []},
+    "source-offer": {"offset": 5,  "unit": "business_day",
+                     "depends_on": ["license-text"]}
+  },
+  "materials": [
+    {"id": "product-notice", "digest": "sha256:aaa",
+     "type": "notice", "scope": "product",
+     "provided_at": "2026-09-26T10:00:00+08:00"},
+    {"id": "common-copy", "digest": "sha256:bbb",
+     "type": "license-copy", "scope": "component", "component": "common",
+     "provided_at": "2026-09-27T10:00:00+08:00"},
+    {"id": "common-source", "digest": "sha256:ddd",
+     "type": "source-archive", "scope": "component", "component": "common",
+     "provided_at": "2026-09-30T10:00:00+08:00"}
+  ],
+  "rules": {"obligations": {
+    "attribution": {"type": "notice"},
+    "license-text": {"all": [
+      {"type": "notice"},
+      {"any": [{"type": "license-copy"}, {"type": "license-bundle"}]}
+    ]},
+    "source-offer": {"all": [
+      {"type": "source-archive"}, {"scope": "component"}
+    ]}
+  }}
+}
+JSON
+
+# 3) 同一内容重放（哪怕顺序乱、时刻换 UTC 写法）-> 200 created=false、
+#    attestation_hash 不变；改了 now/材料再用同一 attestation_id -> 409
+curl -sS "$BASE/v1/admission-attestations/att-2026-10-01-001"
+
+# 4) 任一实例 pending/overdue（如材料晚于 10-06 的 source-offer 截止日）
+#    -> 409 obligations-not-satisfied，且该 attestation_id 查无记录
+#    未知批次 -> 404；batch_hash 不符 -> 409 batch-hash-mismatch
+#    坏时区/坏时刻/缺截止规则/坏证据规则 -> 422
+```
+
+信封错误（非对象、`attestation_id`/`batch_id` 缺失为空或字符非法、
+`batch_hash` 不是 64 位小写十六进制、缺少 `now`/`release_at`/`timezone`/
+`workdays`/`holidays`/`obligations` 任一字段）返回 **400**，与数据库状态
+无关。
+
+**旧库迁移**：升级后首次打开旧版 SQLite 时，准入证明新表以
+`CREATE TABLE IF NOT EXISTS` 建立（`user_version` 升至 4），旧库可直接打开，
+既有规则修订、核算、批次与快照语义全部不变。
+
 **旧库迁移**：升级后首次打开旧版 SQLite 时，每个现有 `rulesets` 行
 （即旧 PUT 写入的内容）原样成为该规则集的**首个活动修订**（修订 id 为
 其内容哈希，`base_revision` 为 `null`），可核验的旧评估记录补盖修订
-id；旧 PUT/GET、既有评估快照与确认版语义全部保持不变。发布批次使用的
-新表在同一迁移中以 `CREATE TABLE IF NOT EXISTS` 建立（`user_version`
-升至 3），旧库可直接打开。
+id；旧 PUT/GET、既有评估快照与确认版语义全部保持不变。发布批次与准入
+证明使用的新表在同一迁移中以 `CREATE TABLE IF NOT EXISTS` 建立
+（`user_version` 升至 4），旧库可直接打开。
 
 ### 提交核算 `POST /v1/assessments`
 
@@ -1365,7 +1503,9 @@ app/rules.py          默认规则集 + 规则校验规范化
 app/revisions.py      不可变修订标识：规范化内容哈希（修订 id / content_hash）
 app/review.py         发布前影响审查：批次信封校验、用目标修订不可变快照重算核算（旧/新状态、summary_hash、采用分支、义务差异、放行→冲突/错误汇总、report_hash）
 app/batches.py        不可变发布批次：批次信封校验（batch_id + 1～50 条目）、同事务快照核验与共享组件/制品去重合并（名称/版本/许可证一致校验、义务并集、rule_revisions、batch_hash）
-app/snapshot.py      批次履约状态快照：期限内材料按 all/any 证据规则判定去重后组件义务（satisfied/overdue/pending）、时区日期期限窗口、depends_on 最终截止日、缺口/命中材料与逾期汇总（snapshot_hash）
+app/snapshot.py       批次履约状态快照：期限内材料按 all/any 证据规则判定去重后组件义务（satisfied/overdue/pending）、时区日期期限窗口、depends_on 最终截止日、缺口/命中材料与逾期汇总（snapshot_hash）；同时导出规范化快照输入供准入证明做内容寻址
+app/attestation.py    不可变准入证明：信封校验（attestation_id/batch_id/期望 batch_hash + 快照输入）、同事务核对冻结批次哈希并重算快照、全部实例 satisfied 才放行（否则 409 且不留记录）、证明内容哈希与内容一致幂等
+app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、共享核算快照的单读事务加载与影响审查前置条件核验、发布批次与准入证明的单写事务登记（锁定核算与规则修订、全成或全败、幂等）
 app/solver.py         义务传播、OR 分支选择（穷举 + 分支定界）、冲突检测、确认版生成
 app/fulfillment.py    履约材料核算：义务实例展开、all/any 证据规则（叶子命中按材料集合累积，可由多份材料共同满足）、全局最小集合选择（穷举 + 分支定界）
 app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日历日/工作日偏移、沿无环依赖反向收紧与收紧链还原
@@ -1373,9 +1513,8 @@ app/responsibility.py 责任分工：责任项展开（制品级/组件级）、
 app/remediation.py   许可证整改：候选表达式/成本校验（非法整体 422）、在持久化快照上重算的全局最优异构组合（穷举 + 完备分支定界，精确有理数成本）、放行方案与 409 唯一最佳失败方案
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
 app/accounting.py    共享的不可变核算快照：只读事务内核验规范化 request、id 绑定、结果体/summary_hash 自洽与重放复现、规则快照与修订内容哈希一致（确认/对比/整改/影响审查四个入口共用）
-app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、共享核算快照的单读事务加载与影响审查前置条件核验、发布批次的单写事务登记（锁定核算与规则修订、全成或全败、幂等）
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变、批次履约状态快照：期限窗口/逾期判定/共享组件一次计数/顺序无关哈希；以及确认/对比/整改/影响审查共享不可变核算快照的逐列篡改拒绝、旧库记录仅在可还原并复现 summary_hash 时接受的回归用例）
+tests/selftest.py     端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变、批次履约状态快照：期限窗口/逾期判定/共享组件一次计数/顺序无关哈希、不可变准入证明：全部 satisfied 才登记/同内容幂等/异内容冲突/拒绝不留记录/规则发布后证明不可变；以及确认/对比/整改/影响审查共享不可变核算快照的逐列篡改拒绝、旧库记录仅在可还原并复现 summary_hash 时接受的回归用例）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 

@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, timezone
 
 from .accounting import AccountingSnapshot, verify_accounting_tuple
+from .attestation import build_admission_attestation
 from .batches import assemble_manifest, canonical_entries
 from .common import ConflictError, NotFound, stable_hash
 from .fulfillment import UnprocessableError
@@ -18,7 +19,8 @@ from .solver import assess_normalized
 #   2 -- immutable revisions: ruleset_revisions / ruleset_active /
 #        ruleset_activations and assessments.revision provenance
 #   3 -- immutable release batches: release_batches / release_batch_items
-SCHEMA_VERSION = 3
+#   4 -- immutable admission attestations: release_batch_attestations
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rulesets (
@@ -84,6 +86,17 @@ CREATE TABLE IF NOT EXISTS release_batch_items (
     revision      TEXT NOT NULL,
     rules_hash    TEXT NOT NULL,
     PRIMARY KEY (batch_id, seq),
+    FOREIGN KEY (batch_id) REFERENCES release_batches(batch_id)
+);
+CREATE TABLE IF NOT EXISTS release_batch_attestations (
+    attestation_id TEXT PRIMARY KEY,
+    batch_id       TEXT NOT NULL,
+    body           TEXT NOT NULL,
+    request_hash   TEXT NOT NULL,
+    batch_hash     TEXT NOT NULL,
+    snapshot_hash  TEXT NOT NULL,
+    attestation_hash TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
     FOREIGN KEY (batch_id) REFERENCES release_batches(batch_id)
 );
 """
@@ -1254,3 +1267,114 @@ class Store:
         finally:
             conn.close()
         return json.loads(row["manifest"]) if row else None
+
+    # -- immutable admission attestations ---------------------------------
+
+    def register_admission_attestation(
+        self, attestation_id, batch_id, expected_hash, body
+    ):
+        """Register one immutable admission attestation in a write txn.
+
+        The whole admission protocol runs inside one ``BEGIN IMMEDIATE``
+        transaction holding the SQLite write lock:
+
+        1. a replay of the same ``attestation_id`` is resolved before any
+           recomputation -- identical normalized content returns the stored
+           proof (``created: false``); different content conflicts;
+        2. the frozen batch manifest is read and the submitted
+           ``batch_hash`` is compared to it (missing batch -> 404,
+           mismatch -> 409);
+        3. the fulfillment snapshot is recomputed from the frozen manifest
+           inside this transaction (invalid inputs -> 422);
+        4. the proof is inserted only when every component obligation
+           instance is ``satisfied`` (otherwise 409) -- any failure rolls
+           the transaction back and leaves no attestation row.
+
+        Because the proof embeds the frozen batch hash, the exact snapshot
+        (including its ``snapshot_hash``) and the pinned rule revisions, a
+        later rules publication or material change cannot alter it.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                stored = conn.execute(
+                    "SELECT batch_id, body, request_hash FROM"
+                    " release_batch_attestations WHERE attestation_id = ?",
+                    (attestation_id,),
+                ).fetchone()
+
+                row = conn.execute(
+                    "SELECT manifest FROM release_batches WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if row is None:
+                    raise NotFound("release batch %r not found" % batch_id)
+                manifest = json.loads(row["manifest"])
+
+                attestation, request_hash = build_admission_attestation(
+                    body, manifest, attestation_id, expected_hash
+                )
+
+                if stored is not None:
+                    if stored["batch_id"] != batch_id \
+                            or stored["request_hash"] != request_hash:
+                        raise ConflictError(
+                            "attestation_id %r is already registered with"
+                            " different content" % attestation_id,
+                            {
+                                "reason": "attestation-id-reused",
+                                "attestation_id": attestation_id,
+                                "registered_batch_id": stored["batch_id"],
+                                "registered_request_hash":
+                                    stored["request_hash"],
+                                "request_hash": request_hash,
+                            },
+                        )
+                    replay = json.loads(stored["body"])
+                    replay["created"] = False
+                    return replay
+
+                now = _now()
+                conn.execute(
+                    "INSERT INTO release_batch_attestations"
+                    "(attestation_id, batch_id, body, request_hash,"
+                    " batch_hash, snapshot_hash, attestation_hash, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        attestation_id,
+                        batch_id,
+                        json.dumps(attestation, sort_keys=True),
+                        request_hash,
+                        attestation["batch_hash"],
+                        attestation["snapshot_hash"],
+                        attestation["attestation_hash"],
+                        now,
+                    ),
+                )
+                conn.commit()
+                return attestation
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def get_admission_attestation(self, attestation_id):
+        """Return a registered attestation (without the ``created`` flag),
+        or None."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT body FROM release_batch_attestations"
+                " WHERE attestation_id = ?",
+                (attestation_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        out = json.loads(row["body"])
+        out.pop("created", None)
+        return out

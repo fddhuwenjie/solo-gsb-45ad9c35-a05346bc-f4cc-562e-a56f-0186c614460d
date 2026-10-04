@@ -71,7 +71,9 @@ def _parse_moment(value, field):
     try:
         return _parse_release_at(value)
     except UnprocessableError:
-        raise
+        raise UnprocessableError(
+            "%s %r is not a valid RFC 3339 timestamp" % (field, value)
+        )
     except ClientError:
         raise UnprocessableError(
             "%s %r is not a valid RFC 3339 timestamp" % (field, value)
@@ -322,13 +324,19 @@ def _utc_z(dt):
     )
 
 
-def build_batch_snapshot(body, manifest, batch_id):
+def compute_batch_snapshot(body, manifest, batch_id):
     """Build the fulfillment status snapshot for a frozen batch manifest.
 
     The API layer guarantees the batch exists (404 otherwise) and that
     *body* is a JSON object (400 otherwise); every scheduling/evidence
     content failure raises :class:`UnprocessableError` (422) before an
     instance is judged, so a partial snapshot can never be returned.
+
+    Returns ``(snapshot, normalized_inputs)`` where *normalized_inputs* is
+    the order- and timezone-spelling-independent canonical projection of
+    the request inputs (equivalent RFC 3339 instants collapse to the same
+    UTC value); it lets callers fingerprint *what was asked* without
+    re-parsing the request.
     """
     artifact_obligations = sorted(manifest.get("artifact_obligations", []))
     components = sorted(
@@ -578,4 +586,29 @@ def build_batch_snapshot(body, manifest, batch_id):
         },
     }
     out["snapshot_hash"] = stable_hash(out)
+
+    normalized_inputs = {
+        "batch_id": batch_id,
+        "now": _utc_z(now),
+        "release_at": _utc_z(release_at),
+        "timezone": tz_name,
+        "workdays": sorted(workdays),
+        "holidays": sorted(h.isoformat() for h in holidays),
+        "obligations": {
+            ob: {
+                "offset": rules[ob]["offset"],
+                "unit": rules[ob]["unit"],
+                "depends_on": rules[ob]["depends_on"],
+            }
+            for ob in sorted(rules)
+        },
+        "materials": out_materials,
+        "rules": evidence,
+    }
+    return out, normalized_inputs
+
+
+def build_batch_snapshot(body, manifest, batch_id):
+    """Stateless, read-only snapshot response (see :func:`compute_batch_snapshot`)."""
+    out, _ = compute_batch_snapshot(body, manifest, batch_id)
     return out
