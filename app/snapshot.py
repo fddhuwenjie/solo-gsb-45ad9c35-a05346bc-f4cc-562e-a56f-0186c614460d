@@ -322,13 +322,20 @@ def _utc_z(dt):
     )
 
 
-def build_batch_snapshot(body, manifest, batch_id):
-    """Build the fulfillment status snapshot for a frozen batch manifest.
+def compute_batch_snapshot(body, manifest, batch_id):
+    """Recompute the fulfillment status snapshot for a frozen batch manifest.
 
     The API layer guarantees the batch exists (404 otherwise) and that
     *body* is a JSON object (400 otherwise); every scheduling/evidence
     content failure raises :class:`UnprocessableError` (422) before an
     instance is judged, so a partial snapshot can never be returned.
+
+    Returns ``(content, snapshot)`` where *content* is the canonical,
+    order-independent response payload without the hash field and
+    *snapshot* adds ``snapshot_hash`` (the SHA-256 of *content*).  The
+    admission-attestation entry point calls this inside its SQLite write
+    transaction and stores the pair verbatim, so the registered proof can
+    never drift from the snapshot that was actually judged.
     """
     artifact_obligations = sorted(manifest.get("artifact_obligations", []))
     components = sorted(
@@ -577,5 +584,18 @@ def build_batch_snapshot(body, manifest, batch_id):
             "pending": counts["pending"],
         },
     }
-    out["snapshot_hash"] = stable_hash(out)
-    return out
+    content = out
+    snapshot = dict(out)
+    snapshot["snapshot_hash"] = stable_hash(content)
+    return content, snapshot
+
+
+def build_batch_snapshot(body, manifest, batch_id):
+    """Build the fulfillment status snapshot for a frozen batch manifest.
+
+    Read-only batch snapshot endpoint wrapper around
+    :func:`compute_batch_snapshot`; it returns the complete response
+    (including ``snapshot_hash``) and never persists anything.
+    """
+    _content, snapshot = compute_batch_snapshot(body, manifest, batch_id)
+    return snapshot

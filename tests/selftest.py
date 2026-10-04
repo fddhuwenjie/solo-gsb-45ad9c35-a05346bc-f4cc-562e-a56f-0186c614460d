@@ -426,6 +426,9 @@ def run_checks():
     # -- fulfillment status snapshots over frozen batches -------------------
     run_batch_snapshot_checks()
 
+    # -- immutable admission attestations -----------------------------------
+    run_attestation_checks()
+
     # -- WITH exception removes propagation ----------------------------------
     exc_request = {
         "components": [
@@ -4376,6 +4379,324 @@ def run_batch_snapshot_checks():
           and bool(eout["snapshot_hash"]),
           json.dumps(eout.get("summary", {})),
     )
+
+
+def run_attestation_checks():
+    """End-to-end checks for POST /v1/release-attestations (+ GET).
+
+    A batch whose six component-obligation instances can all be satisfied
+    backs an immutable admission attestation:
+
+    * registered only inside the all-satisfied gate (pending/overdue ->
+      409 with summary + unmet instances, no row written);
+    * expected batch_hash mismatch -> 422, invalid snapshot inputs ->
+      422, unknown batch -> 404, envelope problems -> 400;
+    * response carries attestation_hash, adopted rule revisions and the
+      exact recomputed snapshot (identical to the read-only snapshot
+      endpoint for the same body);
+    * same attestation_id is idempotent only for normalized-identical
+      content (entry order / UTC-offset spelling independent) and 409 for
+      different content;
+    * a later ruleset publication and later material changes never
+      rewrite the registered proof -- new content becomes a separate
+      attestation.
+    """
+    rules = {
+        "licenses": {
+            "A-MIT": {"obligations": ["attribution", "license-text"]},
+            "A-GPL": {
+                "obligations": ["attribution", "license-text", "source-offer"],
+                "propagates": ["static"],
+            },
+            "A-ISC": {"obligations": ["attribution"]},
+        },
+        "obligation_scopes": {"source-offer": ["binary", "source"]},
+    }
+    code, _ = call("PUT", "/v1/rulesets/attrel", rules)
+    check("attestation: ruleset published", code == 200)
+    code, rs = call("GET", "/v1/rulesets/attrel")
+    r1 = rs["active_revision"]
+
+    def assess(spec):
+        code, out = call("POST", "/v1/assessments",
+                         dict({"ruleset": "attrel"}, **spec))
+        check("attestation: assessment ok (%s)" % spec["product"], code == 200,
+              json.dumps(out)[:160])
+        return out["id"]
+
+    aid1 = assess({
+        "product": "att-a", "distribution": "binary",
+        "components": [
+            {"id": "art-a", "name": "Artifact A", "version": "1.0.0",
+             "license": "A-MIT"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "A-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-a", "to": "common"}],
+    })
+    aid2 = assess({
+        "product": "att-b", "distribution": "binary",
+        "components": [
+            {"id": "art-b", "name": "Artifact B", "version": "0.9.0",
+             "license": "A-ISC"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "A-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-b", "to": "common"}],
+    })
+    code, batch = call("POST", "/v1/release-batches", {
+        "batch_id": "att-rel-1",
+        "entries": [
+            {"assessment_id": aid1, "id": "art-a", "version": "1.0.0",
+             "dependencies": ["common"]},
+            {"assessment_id": aid2, "id": "art-b", "version": "0.9.0",
+             "dependencies": ["common"]},
+        ],
+    })
+    check("attestation: batch registered", code == 200
+          and batch.get("created") is True, json.dumps(batch)[:200])
+    batch_hash = batch["batch_hash"]
+
+    # same deadline geometry as the snapshot suite: source-offer tightens
+    # license-text to 10-06; the component source lands on 10-06 (inside
+    # the date window), so every instance is satisfied at now=10-10.
+    def snapshot_body():
+        return {
+            "now": "2026-10-10T12:00:00+08:00",
+            "release_at": "2026-09-25T16:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+            "workdays": [1, 2, 3, 4, 5],
+            "holidays": ["2026-10-01", "2026-10-02"],
+            "obligations": {
+                "attribution": {"offset": 30, "unit": "calendar_day",
+                                "depends_on": []},
+                "license-text": {"offset": 20, "unit": "calendar_day",
+                                 "depends_on": []},
+                "source-offer": {"offset": 5, "unit": "business_day",
+                                 "depends_on": ["license-text"]},
+            },
+            "materials": [
+                {"id": "product-notice", "digest": "sha256:aaa",
+                 "type": "notice", "scope": "product",
+                 "provided_at": "2026-09-26T10:00:00+08:00"},
+                {"id": "common-copy", "digest": "sha256:bbb",
+                 "type": "license-copy", "scope": "component",
+                 "component": "common",
+                 "provided_at": "2026-09-27T10:00:00+08:00"},
+                {"id": "arta-copy", "digest": "sha256:ccc",
+                 "type": "license-copy", "scope": "component",
+                 "component": "art-a",
+                 "provided_at": "2026-09-27T10:00:00+08:00"},
+                {"id": "common-source", "digest": "sha256:ddd",
+                 "type": "source-archive", "scope": "component",
+                 "component": "common",
+                 "provided_at": "2026-10-06T09:00:00+08:00"},
+            ],
+            "rules": {"obligations": {
+                "attribution": {"type": "notice"},
+                "license-text": {"all": [
+                    {"type": "notice"},
+                    {"any": [{"type": "license-copy"},
+                             {"type": "license-bundle"}]},
+                ]},
+                "source-offer": {"all": [
+                    {"type": "source-archive"}, {"scope": "component"},
+                ]},
+            }},
+        }
+
+    def attest(att_id, body, bid="att-rel-1", bh=batch_hash):
+        payload = {"attestation_id": att_id, "batch_id": bid,
+                   "batch_hash": bh}
+        payload.update(body)
+        return call("POST", "/v1/release-attestations", payload)
+
+    # -- envelope 400s -------------------------------------------------------
+    for bad in [
+        ["not", "an", "object"],
+        {"batch_id": "att-rel-1", "batch_hash": batch_hash,
+         **snapshot_body()},  # missing attestation_id
+        {"attestation_id": "  ", "batch_id": "att-rel-1",
+         "batch_hash": batch_hash, **snapshot_body()},
+        {"attestation_id": "ok-id", "batch_hash": batch_hash,
+         **snapshot_body()},  # missing batch_id
+        {"attestation_id": "ok-id", "batch_id": "att-rel-1",
+         "batch_hash": "abc", **snapshot_body()},  # bad hash
+        {"attestation_id": "ok/id", "batch_id": "att-rel-1",
+         "batch_hash": batch_hash, **snapshot_body()},  # bad id charset
+    ]:
+        code, b = call("POST", "/v1/release-attestations", bad)
+        check("attestation: envelope rejection -> 400 (%r)"
+              % json.dumps(bad)[:60], code == 400, json.dumps(b)[:120])
+
+    # -- hash mismatch / invalid inputs / unknown batch: no row -------------
+    code, b = attest("att-bad-hash", snapshot_body(),
+                     bh="0" * 64)
+    check("attestation: batch_hash mismatch -> 422", code == 422
+          and "attestation_hash" not in b, json.dumps(b)[:160])
+    bad_tz = json.loads(json.dumps(snapshot_body()))
+    bad_tz["timezone"] = "Mars/Olympus"
+    code, b = attest("att-bad-input", bad_tz)
+    check("attestation: invalid snapshot input -> 422", code == 422
+          and "snapshot_hash" not in b, json.dumps(b)[:160])
+    code, b = attest("att-no-batch", snapshot_body(), bid="no-such-batch")
+    check("attestation: unknown batch -> 404", code == 404)
+
+    # -- unmet obligations: overdue and pending -> 409, no row --------------
+    missing_source = json.loads(json.dumps(snapshot_body()))
+    missing_source["materials"] = [
+        m for m in missing_source["materials"] if m["id"] != "common-source"
+    ]
+    code, b = attest("att-unmet-overdue", missing_source)
+    check(
+        "attestation: overdue instance -> 409 with summary and unmet list",
+        code == 409 and b.get("reason") == "obligations-not-satisfied"
+        and b["summary"]["satisfied"] == 5
+        and b["summary"]["overdue"] == 1 and b["summary"]["pending"] == 0
+        and b["unmet_instances"] == [
+            {"component": "common", "obligation": "source-offer",
+             "status": "overdue", "deadline": "2026-10-06"}],
+        json.dumps(b)[:240],
+    )
+    pending = json.loads(json.dumps(missing_source))
+    pending["now"] = "2026-10-06T09:00:00+08:00"
+    code, b = attest("att-unmet-pending", pending)
+    check("attestation: pending instance -> 409",
+          code == 409 and b.get("reason") == "obligations-not-satisfied"
+          and b["summary"]["pending"] == 1 and b["summary"]["overdue"] == 0
+          and b["unmet_instances"][0]["status"] == "pending",
+          json.dumps(b)[:200])
+
+    # -- happy path ----------------------------------------------------------
+    code, att = attest("att-001", snapshot_body())
+    check("attestation: registered", code == 200
+          and att.get("created") is True, json.dumps(att)[:240])
+    check("attestation: hashes pinned",
+          len(att.get("attestation_hash", "")) == 64
+          and att.get("batch_hash") == batch_hash
+          and len(att.get("snapshot_hash", "")) == 64
+          and att.get("snapshot", {}).get("snapshot_hash")
+          == att.get("snapshot_hash"))
+    check("attestation: adopted rule revisions",
+          att.get("adopted_rule_revisions") == [
+              {"ruleset": "attrel", "revision": r1}],
+          str(att.get("adopted_rule_revisions")))
+    check("attestation: all-satisfied summary stored",
+          att.get("summary") == {"total": 6, "satisfied": 6,
+                                 "overdue": 0, "pending": 0})
+
+    # the embedded snapshot is exactly the read-only snapshot endpoint's
+    # output for the same body -- recomputed inside the write transaction
+    code, ro_snap = call(
+        "POST", "/v1/release-batches/att-rel-1/fulfillment-snapshot",
+        dict(snapshot_body(), batch_id="att-rel-1"))
+    check("attestation: snapshot equals read-only snapshot endpoint",
+          code == 200 and att["snapshot"] == ro_snap
+          and att["snapshot_hash"] == ro_snap["snapshot_hash"])
+
+    # attestation_hash covers the record content (re-derive independently)
+    record_without_hash = {k: v for k, v in att.items()
+                           if k not in ("attestation_hash", "created")}
+    embedded_snapshot = record_without_hash.pop("snapshot")
+    expected_hash_value = stable_hash(
+        dict(record_without_hash, snapshot={
+            k: v for k, v in embedded_snapshot.items()
+            if k != "snapshot_hash"}))
+    check("attestation: attestation_hash binds canonical content",
+          att["attestation_hash"] == expected_hash_value)
+
+    # GET
+    code, got = call("GET", "/v1/release-attestations/att-001")
+    check("attestation: GET returns the immutable proof",
+          code == 200 and got.get("attestation_hash") == att["attestation_hash"]
+          and got.get("snapshot_hash") == att["snapshot_hash"]
+          and "created" not in got and got.get("snapshot") == ro_snap)
+    code, _ = call("GET", "/v1/release-attestations/no-such-att")
+    check("attestation: GET unknown -> 404", code == 404)
+
+    # -- idempotency ---------------------------------------------------------
+    code, again = attest("att-001", snapshot_body())
+    check("attestation: identical replay -> created=false, same proof",
+          code == 200 and again.get("created") is False
+          and again["attestation_hash"] == att["attestation_hash"]
+          and again["snapshot_hash"] == att["snapshot_hash"])
+    utc_body = json.loads(json.dumps(snapshot_body()))
+    utc_body["now"] = "2026-10-10T04:00:00Z"
+    utc_body["release_at"] = "2026-09-25T08:00:00Z"
+    code, again = attest("att-001", utc_body)
+    check("attestation: equivalent UTC instants stay idempotent",
+          code == 200 and again.get("created") is False
+          and again["snapshot_hash"] == att["snapshot_hash"])
+    perm = json.loads(json.dumps(snapshot_body()))
+    perm["materials"] = list(reversed(perm["materials"]))
+    perm["workdays"] = [5, 4, 3, 2, 1]
+    code, again = attest("att-001", perm)
+    check("attestation: reordered inputs stay idempotent",
+          code == 200 and again.get("created") is False
+          and again["attestation_hash"] == att["attestation_hash"])
+
+    changed = json.loads(json.dumps(snapshot_body()))
+    changed["now"] = "2026-10-11T12:00:00+08:00"
+    code, b = attest("att-001", changed)
+    check("attestation: same id, different content -> 409",
+          code == 409 and b.get("reason") == "attestation-id-reused"
+          and b.get("registered_batch_id") == "att-rel-1"
+          and b.get("registered_snapshot_hash") == att["snapshot_hash"],
+          json.dumps(b)[:200])
+    code, b = attest("att-001", snapshot_body(), bid="snap-rel-1")
+    check("attestation: same id, different batch -> 409",
+          code == 409 and b.get("reason") == "attestation-id-reused")
+
+    # -- later rules publication and material changes never rewrite ---------
+    v2 = {
+        "licenses": dict(
+            rules["licenses"],
+            **{"A-MIT": {"obligations": ["attribution"]}},
+        ),
+        "obligation_scopes": rules["obligation_scopes"],
+    }
+    code, rev = call("POST", "/v1/rulesets/attrel/revisions",
+                     {"rules": v2, "base_revision": r1})
+    r2 = rev.get("revision")
+    code, _ = call("POST",
+                   "/v1/rulesets/attrel/revisions/%s/activate" % r2,
+                   {"expected_active_revision": r1})
+    check("attestation: later ruleset revision published", code == 200)
+    code, got = call("GET", "/v1/release-attestations/att-001")
+    check("attestation: registered proof immutable after rule publication",
+          code == 200
+          and got["attestation_hash"] == att["attestation_hash"]
+          and got["adopted_rule_revisions"] == [
+              {"ruleset": "attrel", "revision": r1}]
+          and got["snapshot"] == ro_snap)
+
+    # a later, still-satisfying material set is a *separate* attestation:
+    # new content never overwrites att-001.
+    later = json.loads(json.dumps(snapshot_body()))
+    later["materials"].append({
+        "id": "product-bundle", "digest": "sha256:eee",
+        "type": "license-bundle", "scope": "product",
+        "provided_at": "2026-09-28T10:00:00+08:00"})
+    code, att2 = attest("att-002-later", later)
+    check("attestation: changed materials register a new proof",
+          code == 200 and att2.get("created") is True
+          and att2["snapshot_hash"] != att["snapshot_hash"]
+          and att2["attestation_hash"] != att["attestation_hash"]
+          and att2["batch_hash"] == batch_hash)
+    code, got = call("GET", "/v1/release-attestations/att-001")
+    check("attestation: original proof untouched by later attestation",
+          got["attestation_hash"] == att["attestation_hash"]
+          and got["snapshot_hash"] == att["snapshot_hash"])
+
+    # -- no partial writes: exactly the two successful proofs are stored ----
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        stored = sorted(r[0] for r in conn.execute(
+            "SELECT attestation_id FROM release_attestations"))
+    finally:
+        conn.close()
+    check("attestation: failed registrations wrote no rows",
+          stored == ["att-001", "att-002-later"], str(stored))
 
 
 def run_accounting_snapshot_checks():

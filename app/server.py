@@ -22,6 +22,8 @@ Endpoints:
     POST /v1/release-batches
     GET  /v1/release-batches/{batch_id}
     POST /v1/release-batches/{batch_id}/fulfillment-snapshot
+    POST /v1/release-attestations
+    GET  /v1/release-attestations/{attestation_id}
 """
 
 import json
@@ -31,6 +33,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+from .attestations import validate_attestation_body
 from .batches import validate_batch_body
 from .common import ClientError, ConflictError, NotFound, stable_hash
 from .compare import compare_assessments
@@ -59,6 +62,7 @@ _BATCH_RE = re.compile(
     r"^/v1/release-batches(?:/([A-Za-z0-9._-]{1,128})"
     r"(/(?:fulfillment-snapshot))?)?$"
 )
+_ATTEST_RE = re.compile(r"^/v1/release-attestations(?:/([A-Za-z0-9._-]{1,128}))?$")
 
 
 class Api:
@@ -347,6 +351,32 @@ class Api:
             raise ClientError("request body must be a JSON object")
         return build_batch_snapshot(body, manifest, batch_id)
 
+    # -- immutable admission attestations ---------------------------------
+
+    def register_attestation(self, body):
+        # Envelope (400) is validated here; the store then opens one write
+        # transaction in which it reads the frozen batch, recomputes the
+        # snapshot, checks the expected batch hash and the all-satisfied
+        # gate, and -- only then -- writes the immutable proof.
+        attestation_id, batch_id, expected_hash, snapshot_body = \
+            validate_attestation_body(body)
+        record, snapshot, created = self.store.register_attestation(
+            attestation_id, batch_id, expected_hash, snapshot_body
+        )
+        out = dict(record)
+        out["snapshot"] = snapshot
+        out["created"] = created
+        return out
+
+    def get_attestation(self, attestation_id):
+        row = self.store.get_attestation(attestation_id)
+        if row is None:
+            raise NotFound("attestation %r not found" % attestation_id)
+        record, snapshot = row
+        out = dict(record)
+        out["snapshot"] = snapshot
+        return out
+
 
 def make_server(host, port, store):
     api = Api(store)
@@ -426,6 +456,8 @@ def make_server(host, port, store):
                                 "POST /v1/release-batches",
                                 "GET  /v1/release-batches/{batch_id}",
                                 "POST /v1/release-batches/{batch_id}/fulfillment-snapshot",
+                                "POST /v1/release-attestations",
+                                "GET  /v1/release-attestations/{attestation_id}",
                             ],
                         },
                     )
@@ -446,6 +478,14 @@ def make_server(host, port, store):
                         200,
                         api.release_batch_snapshot(m.group(1), self._body()),
                     )
+
+                m = _ATTEST_RE.match(path)
+                if m:
+                    attestation_id = m.group(1)
+                    if method == "POST" and attestation_id is None:
+                        return self._json(200, api.register_attestation(self._body()))
+                    if method == "GET" and attestation_id is not None:
+                        return self._json(200, api.get_attestation(attestation_id))
 
                 m = _REVISION_RE.match(path)
                 if m:

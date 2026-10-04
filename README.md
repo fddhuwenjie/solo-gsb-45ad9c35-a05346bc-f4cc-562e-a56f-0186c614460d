@@ -28,7 +28,7 @@ python3 main.py
 数据持久化在 SQLite（容器内 `/data/app.db`，本地默认 `./data/app.db`，
 环境变量 `APP_DB` 可改）。
 
-自检（启动临时实例跑 520 项端到端检查）：
+自检（启动临时实例跑 598 项端到端检查）：
 
 ```bash
 python3 tests/selftest.py
@@ -58,6 +58,8 @@ python3 tests/selftest.py
 | POST | `/v1/release-batches` | 登记不可变许可证发布批次（内容一致时幂等） |
 | GET | `/v1/release-batches/{batch_id}` | 读取已登记批次清单 |
 | POST | `/v1/release-batches/{batch_id}/fulfillment-snapshot` | 批次履约状态快照（截止日 + 证据判定） |
+| POST | `/v1/release-attestations` | 登记发布批次的不可变准入证明（全部义务满足时才写入） |
+| GET | `/v1/release-attestations/{attestation_id}` | 读取已登记的不可变准入证明 |
 
 ### 不可变修订与原子发布（含并发发布与回滚）
 
@@ -571,7 +573,137 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
 其内容哈希，`base_revision` 为 `null`），可核验的旧评估记录补盖修订
 id；旧 PUT/GET、既有评估快照与确认版语义全部保持不变。发布批次使用的
 新表在同一迁移中以 `CREATE TABLE IF NOT EXISTS` 建立（`user_version`
-升至 3），旧库可直接打开。
+升至 3），旧库可直接打开。准入证明表 `release_attestations` 随后续
+版本建立（`user_version` 升至 4），同为幂等 `CREATE TABLE IF NOT
+EXISTS`，不改动任何既有数据。
+
+### 不可变准入证明 `POST /v1/release-attestations`
+
+在选定时刻为一个**已冻结登记**的发布批次登记不可变的**准入证明**：
+调用方提交唯一 `attestation_id`、`batch_id`、*期望的* `batch_hash`，
+以及与履约快照接口完全相同的一组快照输入（当前时刻 `now`、发布时刻
+`release_at`、IANA `timezone`、`workdays`/`holidays`、各义务的
+`{offset, unit, depends_on}` 截止规则、每份带 `provided_at` 的履约
+材料 `materials` 与嵌套 `all`/`any` 证据规则 `rules`）。
+
+服务端在**同一个 SQLite 即时写事务**（`BEGIN IMMEDIATE`，整笔操作
+持有写锁）中：① 读取冻结批次清单；② 按提交输入**重算**履约快照；
+③ 核对期望 `batch_hash` 与清单哈希；④ 确认**每个**组件义务实例均为
+`satisfied`（不存在任何 `pending`/`overdue`）。任一条件不满足都整体
+回滚，**绝不写入证明记录**：
+
+- 快照输入任何一处非法（未知时区、非法时刻/日期、缺义务规则、悬空
+  依赖、依赖成环、非法材料/证据规则等，判定口径与
+  `fulfillment-snapshot` 完全一致）→ **422**；
+- 批次不存在 → **404**；
+- 期望 `batch_hash` 与冻结清单哈希不符 → **422**（整笔拒绝，不写记录）；
+- 存在未满足义务（`pending` 或 `overdue`）→ **409**
+  `reason: "obligations-not-satisfied"`，响应体重算的 `summary` 与
+  排序后的 `unmet_instances`（每项含 `component`/`obligation`/
+  `status`/`deadline`），便于定位缺口；
+- 信封错误（非对象、`attestation_id`/`batch_id` 缺失或含非法字符、
+  `batch_hash` 不是 64 位小写十六进制）→ **400**。
+
+全部满足时写入证明，返回 `attestation_hash`、批次哈希、**采用的规则
+修订**（冻结清单 `rule_revisions` 中 `(ruleset, revision)` 的去重
+集合）、判定 `summary` 与重算得到的完整 `snapshot`（与对同一批次、
+同一请求体调用 `fulfillment-snapshot` 的结果逐字节一致，含
+`snapshot_hash`）。`attestation_hash` 是规范化证明内容（批次哈希、
+快照哈希、采用修订、汇总与不含哈希字段的快照内容）的 SHA-256。
+
+```bash
+BASE=http://localhost:8080
+
+# 为全部义务均已满足的批次登记准入证明
+# （请求体 = attestation_id/batch_id/batch_hash + 快照输入）
+curl -sS -X POST "$BASE/v1/release-attestations" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "attestation_id": "att-2026-10-10-001",
+    "batch_id": "release-2026-10-01",
+    "batch_hash": "b75b3f19…（GET 批次清单得到的 64 位哈希）",
+    "now": "2026-10-10T12:00:00+08:00",
+    "release_at": "2026-09-25T16:00:00+08:00",
+    "timezone": "Asia/Shanghai",
+    "workdays": [1, 2, 3, 4, 5],
+    "holidays": ["2026-10-01", "2026-10-02"],
+    "obligations": {
+      "attribution":  {"offset": 30, "unit": "calendar_day", "depends_on": []},
+      "license-text": {"offset": 20, "unit": "calendar_day", "depends_on": []},
+      "source-offer": {"offset": 5,  "unit": "business_day",
+                       "depends_on": ["license-text"]}
+    },
+    "materials": [
+      {"id": "product-notice", "digest": "sha256:aaa", "type": "notice",
+       "scope": "product", "provided_at": "2026-09-26T10:00:00+08:00"},
+      {"id": "common-copy", "digest": "sha256:bbb", "type": "license-copy",
+       "scope": "component", "component": "common",
+       "provided_at": "2026-09-27T10:00:00+08:00"},
+      {"id": "common-source", "digest": "sha256:ddd", "type": "source-archive",
+       "scope": "component", "component": "common",
+       "provided_at": "2026-10-06T09:00:00+08:00"}
+    ],
+    "rules": {"obligations": {
+      "attribution": {"type": "notice"},
+      "license-text": {"all": [
+        {"type": "notice"},
+        {"any": [{"type": "license-copy"}, {"type": "license-bundle"}]}
+      ]},
+      "source-offer": {"all": [
+        {"type": "source-archive"}, {"scope": "component"}]}
+    }}
+  }' | python3 -m json.tool
+```
+
+```json
+{
+  "attestation_id": "att-2026-10-10-001",
+  "batch_id": "release-2026-10-01",
+  "batch_hash": "b75b3f19…（64 位）",
+  "snapshot_hash": "8c2e77a0…（64 位）",
+  "adopted_rule_revisions": [
+    {"ruleset": "default", "revision": "9f12d4f1324eaea3"}
+  ],
+  "summary": {"total": 6, "satisfied": 6, "overdue": 0, "pending": 0},
+  "attestation_hash": "1d9b0c4e…（64 位 SHA-256）",
+  "created": true,
+  "snapshot": {
+    "batch_id": "release-2026-10-01",
+    "batch_hash": "b75b3f19…",
+    "schedule": [ … ],
+    "materials": [ … ],
+    "instances": [ … 全部 "status": "satisfied" … ],
+    "summary": {"total": 6, "satisfied": 6, "overdue": 0, "pending": 0},
+    "snapshot_hash": "8c2e77a0…"
+  }
+}
+```
+
+**幂等、冲突与不可变性**：
+
+- 相同 `attestation_id` 携带**规范化后一致**的内容重放 → **200**、
+  `"created": false`，返回逐字节相同的证明/快照/哈希。规范化口径与
+  快照接口一致：材料与对象键顺序无关、`workdays`/`holidays`/
+  `depends_on` 顺序无关，同一时刻的不同写法（如
+  `2026-09-25T08:00:00Z` 与 `2026-09-25T16:00:00+08:00`）也视为
+  同一内容（比较的是重算得到的 `snapshot_hash`，而非请求体原文）。
+- 相同 `attestation_id` 携带**不同规范化内容**（哪怕批次相同、全部
+  义务仍满足）→ **409** `reason: "attestation-id-reused"`（附已登记
+  的 `registered_batch_id` 与 `registered_snapshot_hash`）；同一 id
+  指向不同 `batch_id` 同样 **409**。
+- 证明一旦登记即为**不可变**事实：之后的规则发布（新修订/激活/
+  回滚）与后续材料变化都**不会改写**已登记证明——证明中保存的是
+  登记事务内重算并锁定的快照与当时采用的规则修订；材料或时刻不同
+  的后续核算应使用新的 `attestation_id` 另行登记。可随时用
+  `GET /v1/release-attestations/{attestation_id}` 读取（未知 id 返回
+  404；GET 响应不含 `created` 字段）。
+
+```bash
+# 全部满足 -> 200/created=true；重放 -> 200/created=false（哈希不变）
+# 缺一份关键材料 -> 409，响应给出 summary 与 unmet_instances，且不留记录
+# batch_hash 抄错 / 坏时区 / 坏 provided_at -> 422（不留记录）
+curl -sS "$BASE/v1/release-attestations/att-2026-10-10-001"
+```
 
 ### 提交核算 `POST /v1/assessments`
 

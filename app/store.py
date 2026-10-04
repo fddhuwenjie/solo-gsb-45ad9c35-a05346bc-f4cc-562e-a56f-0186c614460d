@@ -7,10 +7,12 @@ import threading
 from datetime import datetime, timezone
 
 from .accounting import AccountingSnapshot, verify_accounting_tuple
+from .attestations import build_attestation, require_all_satisfied
 from .batches import assemble_manifest, canonical_entries
 from .common import ConflictError, NotFound, stable_hash
 from .fulfillment import UnprocessableError
 from .revisions import revision_id
+from .snapshot import compute_batch_snapshot
 from .solver import assess_normalized
 
 # user_version history:
@@ -18,7 +20,8 @@ from .solver import assess_normalized
 #   2 -- immutable revisions: ruleset_revisions / ruleset_active /
 #        ruleset_activations and assessments.revision provenance
 #   3 -- immutable release batches: release_batches / release_batch_items
-SCHEMA_VERSION = 3
+#   4 -- immutable admission attestations: release_attestations
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rulesets (
@@ -85,6 +88,16 @@ CREATE TABLE IF NOT EXISTS release_batch_items (
     rules_hash    TEXT NOT NULL,
     PRIMARY KEY (batch_id, seq),
     FOREIGN KEY (batch_id) REFERENCES release_batches(batch_id)
+);
+CREATE TABLE IF NOT EXISTS release_attestations (
+    attestation_id TEXT PRIMARY KEY,
+    batch_id       TEXT NOT NULL,
+    attestation    TEXT NOT NULL,
+    snapshot       TEXT NOT NULL,
+    batch_hash     TEXT NOT NULL,
+    snapshot_hash  TEXT NOT NULL,
+    content_hash   TEXT NOT NULL,
+    created_at     TEXT NOT NULL
 );
 """
 
@@ -1254,3 +1267,143 @@ class Store:
         finally:
             conn.close()
         return json.loads(row["manifest"]) if row else None
+
+    # -- immutable admission attestations ---------------------------------
+
+    def register_attestation(
+        self, attestation_id, batch_id, expected_hash, snapshot_body
+    ):
+        """Register one immutable admission attestation in one transaction.
+
+        A ``BEGIN IMMEDIATE`` write transaction takes the SQLite write lock
+        for the whole operation.  Inside it the store:
+
+        1. resolves the idempotency/conflict state of *attestation_id*;
+        2. reads the frozen batch manifest (unknown batch -> NotFound);
+        3. recomputes the fulfillment snapshot from the submitted inputs
+           over that exact manifest (any invalid input -> 422);
+        4. compares the expected ``batch_hash`` with the manifest hash
+           (mismatch -> 422) and refuses any non-satisfied instance
+           (pending/overdue -> ConflictError 409);
+        5. writes the attestation and the judged snapshot together.
+
+        Any failure rolls the whole transaction back: an attestation is
+        never written for an invalid input, a wrong hash or an unmet
+        obligation.  A repeated ``attestation_id`` is idempotent only for
+        normalized-identical content (same ``content_hash`` and
+        ``snapshot_hash``); different content conflicts (409).
+
+        Returns ``(record, snapshot, created)``.
+        """
+        content_hash = stable_hash(snapshot_body)
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                existing = conn.execute(
+                    "SELECT batch_id, attestation, snapshot, content_hash,"
+                    " snapshot_hash FROM release_attestations"
+                    " WHERE attestation_id = ?",
+                    (attestation_id,),
+                ).fetchone()
+
+                row = conn.execute(
+                    "SELECT manifest, batch_hash FROM release_batches"
+                    " WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if row is None:
+                    raise NotFound("release batch %r not found" % batch_id)
+                manifest = json.loads(row["manifest"])
+
+                if existing is not None and existing["batch_id"] != batch_id:
+                    raise ConflictError(
+                        "attestation_id %r is already registered for a "
+                        "different batch %r"
+                        % (attestation_id, existing["batch_id"]),
+                        {
+                            "reason": "attestation-id-reused",
+                            "attestation_id": attestation_id,
+                            "registered_batch_id": existing["batch_id"],
+                        },
+                    )
+
+                # Recompute the snapshot over the locked manifest inside
+                # this transaction: an invalid input raises here and rolls
+                # everything back before any hash/status gate or write.
+                content, snapshot = compute_batch_snapshot(
+                    snapshot_body, manifest, batch_id
+                )
+
+                if manifest.get("batch_hash") != expected_hash:
+                    raise UnprocessableError(
+                        "expected batch_hash %s does not match the frozen "
+                        "manifest hash %s of batch %r"
+                        % (expected_hash, manifest.get("batch_hash"), batch_id)
+                    )
+
+                if existing is not None:
+                    stored = json.loads(existing["attestation"])
+                    if (
+                        stored.get("batch_hash") == manifest.get("batch_hash")
+                        and existing["snapshot_hash"] == snapshot["snapshot_hash"]
+                    ):
+                        # Idempotent replay of the same normalized content
+                        # (entry order and equivalent UTC-offset spellings
+                        # normalize to the same snapshot_hash): the frozen
+                        # proof is returned verbatim and never recomputed.
+                        return stored, json.loads(existing["snapshot"]), False
+                    raise ConflictError(
+                        "attestation_id %r is already registered with "
+                        "different content" % attestation_id,
+                        {
+                            "reason": "attestation-id-reused",
+                            "attestation_id": attestation_id,
+                            "registered_batch_id": existing["batch_id"],
+                            "registered_snapshot_hash": existing["snapshot_hash"],
+                        },
+                    )
+
+                require_all_satisfied(snapshot)
+
+                record = build_attestation(attestation_id, manifest, content, snapshot)
+                now = _now()
+                conn.execute(
+                    "INSERT INTO release_attestations"
+                    "(attestation_id, batch_id, attestation, snapshot,"
+                    " batch_hash, snapshot_hash, content_hash, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        attestation_id,
+                        batch_id,
+                        json.dumps(record, sort_keys=True),
+                        json.dumps(snapshot, sort_keys=True),
+                        manifest["batch_hash"],
+                        snapshot["snapshot_hash"],
+                        content_hash,
+                        now,
+                    ),
+                )
+                conn.commit()
+                return record, snapshot, True
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def get_attestation(self, attestation_id):
+        """Return ``(record, snapshot)`` for a registered attestation."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT attestation, snapshot FROM release_attestations"
+                " WHERE attestation_id = ?",
+                (attestation_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return json.loads(row["attestation"]), json.loads(row["snapshot"])
